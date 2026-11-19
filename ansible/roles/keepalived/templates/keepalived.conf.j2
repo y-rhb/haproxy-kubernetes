@@ -1,0 +1,64 @@
+global_defs {
+    router_id {{ inventory_hostname }}
+    enable_script_security
+    script_user root
+}
+
+vrrp_script check_haproxy {
+    script "{{ keepalived_check_script }}"
+    interval {{ keepalived_check_interval }}
+    weight {{ keepalived_check_weight }}
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    # Config preempt standard : node0 = MASTER (prio 101), node1 = BACKUP (prio 100).
+    # Le track_script check_haproxy (weight negatif) baisse la priorite si HAProxy
+    # meurt -> le pair de priorite superieure preempte et prend la VIP. Au retour
+    # d'un noeud, il reprend la VIP (micro-coupure graceful, acceptable LB stateless).
+    state {% if groups['haproxy'].index(inventory_hostname) == 0 %}MASTER{% else %}BACKUP{% endif %}
+
+    interface {{ vip_interface }}
+    virtual_router_id {{ vrrp_router_id }}
+    priority {{ keepalived_priority }}
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass {{ keepalived_auth_pass }}
+    }
+
+    virtual_ipaddress {
+        {{ vip_address }}
+    }
+
+    track_script {
+        check_haproxy
+    }
+}
+{% if vip_address_prod is defined and vip_interface_prod is defined %}
+
+vrrp_instance VI_2 {
+    # Meme config preempt standard que VI_1 (2e VIP PROD).
+    state {% if groups['haproxy'].index(inventory_hostname) == 0 %}MASTER{% else %}BACKUP{% endif %}
+
+    interface {{ vip_interface_prod }}
+    virtual_router_id {{ vrrp_router_id_prod }}
+    priority {{ keepalived_priority }}
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass {{ keepalived_auth_pass }}
+    }
+
+    virtual_ipaddress {
+        {{ vip_address_prod }}
+    }
+
+    track_script {
+        check_haproxy
+    }
+}
+{% endif %}

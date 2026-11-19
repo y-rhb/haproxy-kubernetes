@@ -1,0 +1,38 @@
+# ============================================================================
+# SPOE config HAProxy <-> coraza-spoa (GENERE PAR ANSIBLE)
+# Reference par : filter spoe engine coraza config <coraza_spoe_config_path>
+# (frontend public_https, cf conf.d/10-keycloak-public.cfg.j2). Backend d'agents
+# 'spoe-coraza' declare dans conf.d/05-coraza-spoa.cfg.j2.
+# ============================================================================
+# Cablage ALIGNE sur l'exemple upstream v0.7.2 (groups + spoe-group + send-spoe-group
+# cote frontend) pour la maintenabilite. Le frontend pose txn.coraza.app AVANT
+# d'envoyer le groupe, et lit le verdict dans var(txn.coraza.action).
+#
+# PERIMETRE v1 = headers / URL / query (PAS de body : req.body n'est PAS transmis
+# -> pas de secret OIDC (POST /token) chez l'agent, economie CPU sur 2 vCPU/2 GB).
+#
+
+[coraza]
+
+spoe-agent coraza-agent
+    groups       coraza-req
+    # var-prefix : le verdict est lu cote HAProxy via var(txn.coraza.action).
+    option       var-prefix   coraza
+    # set-on-error : pose txn.coraza.error si l'agent ne repond pas. On NE bloque PAS
+    # sur erreur (fail-OPEN, decision actee) : la regle deny ne matche que action=deny.
+    option       set-on-error error
+    timeout      hello        2s
+    timeout      idle         2m
+    timeout      processing   500ms
+    use-backend  spoe-coraza
+    log          global
+
+spoe-group coraza-req
+    messages coraza-req
+
+spoe-message coraza-req
+    # Body VOLONTAIREMENT absent (WAF headers/URL/query-only en v1). app resolue via
+    # la variable posee par le frontend (str(default)). PAS d'event : le message est
+    # dans un group declenche par 'send-spoe-group' (frontend), pas auto-envoye sur
+    # evenement (aligne example upstream v0.7.2 ; un event ici serait inerte + trompeur).
+    args    app=var(txn.coraza.app) src-ip=src src-port=src_port method=method path=path query=query version=req.ver headers=req.hdrs

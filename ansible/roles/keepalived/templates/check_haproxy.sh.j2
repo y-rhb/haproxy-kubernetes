@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+
+# Health check script for HAProxy
+# Used by keepalived to determine VRRP priority
+
+# Check 1: HAProxy process is alive
+# pgrep (procps-ng, toujours present sur Rocky) au lieu de killall (psmisc, pas
+# garanti installe) : killall absent -> rc 127 -> track_script en FAULT permanent
+# -> pas de failover VRRP. -x = match exact du nom de process.
+pgrep -x haproxy > /dev/null 2>&1 || exit 1
+
+# Check 2: HAProxy stats socket responds
+echo "show info" | socat /var/lib/haproxy/stats stdio > /dev/null 2>&1 || exit 1
+
+exit 0

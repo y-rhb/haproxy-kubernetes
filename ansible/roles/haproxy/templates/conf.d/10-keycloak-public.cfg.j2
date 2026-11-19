@@ -1,0 +1,100 @@
+# ============================================================================
+# Fragment conf.d : Keycloak publie en DMZ
+# GENERE PAR ANSIBLE (HAProxy_DMZ_IaC) — NE PAS EDITER A LA MAIN
+# Pipeline : {{ lookup('env', 'CI_PIPELINE_ID') | default('run manuel', true) }} — commit : {{ lookup('env', 'CI_COMMIT_SHORT_SHA') | default('n/a', true) }}
+#
+# Reverse-proxy PUBLIC sacrifiable : termine le TLS, filtre (rate-limit +
+# allow-list Host + ACL paths), puis re-encrypt vers l'Ingress public K8s
+# (ingressClass nginx-public). Le cœur K8s n'est jamais expose : ce proxy ne
+# sait parler qu'a {{ metallb_public_ingress_ip }}:443. Contrat d'adressage
+# (FQDN, IP ingress, IP mailcow, rate-limit) : voir group_vars/haproxy.yml.
+# ============================================================================
+
+frontend public_https
+    # Bind multi-cert : HAProxy choisit le cert par SNI TLS du client.
+    #  - {{ haproxy_tls_cert_path }} (PKI interne) = cert par defaut / fallback.
+    #  - UN cert Let's Encrypt par FQDN public (le_public_fqdns), ajoute UNIQUEMENT si
+    #    le_enabled -> servi pour le SNI correspondant (reconnu GCP/navigateurs).
+    # Conditionnel : sans cert LE sur disque, HAProxy refuserait de demarrer (crt absent).
+    bind {{ vip_address }}:443 ssl crt {{ haproxy_tls_cert_path }}{% if le_enabled | default(false) | bool %}{% for fqdn in le_public_fqdns %} crt {{ le_cert_dir }}/{{ fqdn }}.pem{% endfor %}{% endif %}
+
+    mode http
+    option httplog
+
+    # --- Durcissement des reponses ---
+    http-response set-header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # --- Rate-limit par IP source (1re ligne exposee a Internet) ---
+    # Table en memoire : nombre de requetes HTTP sur 10s par IP source. On track
+    # AVANT le filtre Host pour compter aussi les sondes vers des Host non publies.
+    stick-table type ip size 100k expire 10m store http_req_rate(10s)
+    http-request track-sc0 src
+    http-request deny deny_status 429 if { sc_http_req_rate(0) gt {{ dmz_rate_limit_per_10s }} }
+
+    # --- Allow-list Host : seuls les FQDN publies passent, le reste est refuse ---
+    # Defense : meme si un DNS pointe la VIP par erreur, le proxy ne route que
+    # l'explicitement autorise (pas de backend "fourre-tout").
+    # host_only retire le port du champ Host avant la comparaison.
+    acl host_keycloak hdr(host),host_only -i {{ keycloak_public_fqdn }}
+    http-request deny deny_status 403 unless host_keycloak
+
+    # --- ACL paths Keycloak  ---
+    # /realms + /resources = endpoints publics OIDC (SSO navigateur + assets) -> ouverts.
+    # /admin (console + Admin REST API) = sensible : reserve a l'IP source mailcow
+    # (flow Mailpassword : mailcow valide les logins SMTP/IMAP via l'Admin REST API).
+    # Le proxy est le SEUL a voir la vraie IP client (apres re-encrypt l'ingress ne
+    # voit que l'IP du proxy) -> l'ACL doit vivre ICI.
+    acl path_admin path_beg -i /admin
+{% if mailcow_src_ip is defined and mailcow_src_ip | length > 0 %}
+    acl src_mailcow src {{ mailcow_src_ip }}
+    http-request deny deny_status 403 if path_admin !src_mailcow
+{% else %}
+    # mailcow_src_ip non renseignee (group_vars) -> /admin ferme a TOUS depuis la
+    # DMZ (defaut sur). Ouvrir le flow Mailpassword = renseigner l'IP de la VM mailcow.
+    http-request deny deny_status 403 if path_admin
+{% endif %}
+{% if coraza_waf_enabled | default(false) | bool %}
+
+    # --- WAF applicatif : Coraza (OWASP CRS) via SPOE ---  [DMZ-ONLY]
+    # L'agent coraza-spoa (loopback, role coraza_spoa) inspecte headers/URL/query et
+    # pose son verdict dans var(txn.coraza.action). Cablage aligne sur l'exemple
+    # upstream v0.7.2 : on nomme l'application (txn.coraza.app) puis on declenche le
+    # groupe SPOE, avant de lire le verdict.
+    # v1 = SecRuleEngine DetectionOnly : coraza OBSERVE et logge mais n'emet JAMAIS
+    # action=deny -> la regle 'deny' ci-dessous est INERTE. Passage au blocage =
+    # coraza_spoa_rule_engine: On (group_vars) -> AUCUNE modif ici.
+    # fail-OPEN (decision actee) : agent DOWN/erreur -> var non posee -> requete passe
+    # -> Keycloak reste dispo (rate-limit + allow-list + ACL /admin restent actifs).
+    # default(false) : si la var n'est pas definie (ex. jumeau HAProxy_Iac interne
+    # sans coraza), le filter n'est PAS rendu (fail-safe). En DMZ = true (group_vars).
+    filter spoe engine coraza config {{ coraza_spoe_config_path | default('/etc/haproxy/coraza.cfg') }}
+    http-request set-var(txn.coraza.app) str(default)
+    http-request send-spoe-group coraza coraza-req
+    http-request deny deny_status 403 if { var(txn.coraza.action) -m str deny }
+{% endif %}
+
+    default_backend keycloak_public_backend
+
+backend keycloak_public_backend
+    mode http
+    # X-Forwarded-* poses explicitement pour Keycloak (hostname dynamique) : le port
+    # public ({{ keycloak_public_port }}) != le port d'ecoute de l'ingress (443).
+    # nginx-public (use-forwarded-headers=true) LIT X-Forwarded-Port au lieu de le
+    # recalculer a 443 -> Keycloak ecrit l'issuer OIDC avec le bon port. set-header
+    # REMPLACE (anti-spoofing : ecrase toute valeur fournie par le client). Host SANS
+    # port + Port explicite = non ambigu (regle Keycloak : X-Forwarded-Port prime).
+    http-request set-header X-Forwarded-Proto https
+    http-request set-header X-Forwarded-Port {{ keycloak_public_port }}
+    http-request set-header X-Forwarded-Host {{ keycloak_public_fqdn }}
+    option forwardfor
+    # Health check applicatif : endpoint OIDC public du realm master (200 attendu).
+    # Le check emprunte TLS+SNI comme le trafic reel (check-sni) ; sans SNI au check
+    # l'ingress repondrait avec un cert par defaut et la verif TLS echouerait -> down.
+    option httpchk
+    http-check send meth GET uri /realms/master hdr Host {{ keycloak_public_fqdn }}
+    http-check expect status 200
+    # Re-encrypt vers l'Ingress public : SNI = FQDN publie (nginx-public route par
+    # SNI/Host) ; verif STRICTE du cert backend (signe pki_int) via ca.crt, qui contient
+    # desormais la CHAINE COMPLETE (root + SubCA + intermediaire) grace au manual_chain
+    # sur pki_int + au role qui consomme ca_chain. Trafic jamais en clair DMZ -> LAN-PROD.
+    server ingress-public {{ metallb_public_ingress_ip }}:443 ssl sni str({{ keycloak_public_fqdn }}) check check-sni {{ keycloak_public_fqdn }} verify required ca-file {{ tls_dest_dir }}/ca.crt

@@ -1,0 +1,20 @@
+# ============================================================================
+# Fragment conf.d : backend d'agents SPOE vers coraza-spoa (WAF)
+# GENERE PAR ANSIBLE (HAProxy_DMZ_IaC) — NE PAS EDITER A LA MAIN
+# ============================================================================
+# HAProxy interroge cet agent (loopback) pour chaque requete du frontend
+# public_https (filter spoe -> coraza.cfg -> use-backend spoe-coraza). L'agent
+# coraza-spoa est installe/demarre par le role coraza_spoa AVANT haproxy.
+# Prefixe 05- : charge AVANT 10-keycloak-public (le frontend reference ce backend).
+# DMZ-ONLY : n'existe pas dans HAProxy_IaC interne (le role coraza_spoa non plus).
+# ============================================================================
+
+{% if coraza_waf_enabled | default(false) | bool %}
+backend spoe-coraza
+    mode tcp
+    # spop-check : health-check natif du protocole SPOP (marque l'agent DOWN s'il
+    # ne repond pas). inter court + fall 2 : sort vite l'agent du pool s'il flappe
+    # (Restart=always) -> minimise la fenetre de latence fail-open pendant un redemarrage.
+    option spop-check
+    server coraza {{ coraza_spoa_bind_ip }}:{{ coraza_spoa_bind_port }} check inter 2s rise 1 fall 2
+{% endif %}

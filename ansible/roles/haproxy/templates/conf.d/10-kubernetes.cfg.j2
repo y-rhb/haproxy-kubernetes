@@ -1,0 +1,60 @@
+# ============================================================================
+# Fragment conf.d : Kubernetes (API server + Ingress Controller)
+# GENERE PAR ANSIBLE (HAProxy_IaC) — NE PAS EDITER A LA MAIN
+# Pipeline : {{ lookup('env', 'CI_PIPELINE_ID') | default('run manuel', true) }} — commit : {{ lookup('env', 'CI_COMMIT_SHORT_SHA') | default('n/a', true) }}
+#
+# Rapatrie depuis kube_on_vcenter/roles/haproxy_k8s_backend (blockinfile) le
+# 2026-06-12 : la conf HAProxy est centralisee ici, les consommateurs
+# contribuent par MR (voir README "Contribuer un frontend").
+# Le contrat d'adressage (VIPs, IPs control planes, IP MetalLB) est statique :
+# voir group_vars/haproxy.yml.
+# ============================================================================
+
+# Kubernetes API Server — bind sur 2 VIPs :
+# - VIP MGMT (admin : kubectl, CI, kubelet)
+# - VIP PROD (API interne d'infra : Vault auth/kubernetes tokenreview)
+frontend kubernetes_api
+    bind {{ vip_address }}:{{ k8s_api_port }}
+    bind {{ vip_address_prod }}:{{ k8s_api_port }}
+    mode tcp
+    option tcplog
+    default_backend kubernetes_api_backend
+
+backend kubernetes_api_backend
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    default-server inter 3s fall 3 rise 2
+{% for cp in k8s_control_plane_endpoints %}
+    server {{ cp.name }} {{ cp.ip }}:{{ k8s_api_port }} check
+{% endfor %}
+
+# Ingress Controller HTTP — double bind VIP MGMT + VIP PROD
+# Les deux adresses virtuelles desservent des segments distincts.
+# Backend unique = MetalLB LoadBalancer IP sur LAN-PROD.
+frontend ingress_http
+    bind {{ vip_address }}:80
+    bind {{ vip_address_prod }}:80
+    mode tcp
+    option tcplog
+    default_backend ingress_http_backend
+
+backend ingress_http_backend
+    mode tcp
+    option tcp-check
+    default-server inter 3s fall 3 rise 2
+    server metallb-ingress {{ metallb_ingress_ip }}:80 check
+
+# Ingress Controller HTTPS — double bind VIP MGMT + VIP PROD (cf rationale ci-dessus)
+frontend ingress_https
+    bind {{ vip_address }}:443
+    bind {{ vip_address_prod }}:443
+    mode tcp
+    option tcplog
+    default_backend ingress_https_backend
+
+backend ingress_https_backend
+    mode tcp
+    option tcp-check
+    default-server inter 3s fall 3 rise 2
+    server metallb-ingress {{ metallb_ingress_ip }}:443 check
